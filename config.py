@@ -108,9 +108,14 @@ TURN_END_SILENCE_SEC = float(os.environ.get("TURN_END_SILENCE_SEC", "0.8"))
 # ---------------------------------------------------------------------------
 # In interpret mode a segment is finalized after this much continuous speech
 # (no trailing silence required) so translation runs while the caller talks.
-# 4000ms: long enough for complete thoughts; 1500 chopped the speech into
-# fragments ("engage in the luxury") that translated into stuttering clips.
-TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "4000"))
+# 2500ms balances latency vs fragmentation: 4000 let segments grow to 25s+
+# (bot fell 20-30s behind the caller); 1500 chopped into fragments.
+TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "2500"))
+# A queued translation older than this (from caller speech that has long been
+# overtaken) is dropped instead of spoken — an interpreter re-syncs rather
+# than reading 30s-old text. Bounds the backlog when output speech is longer
+# than the input speech it translates.
+TRANSLATE_STALE_SEC = float(os.environ.get("TRANSLATE_STALE_SEC", "8.0"))
 TRANSLATE_PROMPT = os.environ.get(
     "TRANSLATE_PROMPT",
     "你是同声传译。把用户接下来输入的话翻译成目标语言。"

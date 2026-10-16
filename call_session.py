@@ -103,7 +103,9 @@ class CallSession:
         self.interp_target: str | None = None
         # Interpret mode serializes playback through one pump task so two
         # speak() loops can never interleave chunks into the Twilio stream.
-        self._interp_q: asyncio.Queue[str] = asyncio.Queue()
+        # Items are (enqueue_monotonic, text); stale items are dropped so the
+        # bot re-syncs with the caller instead of speaking hours-old text.
+        self._interp_q: asyncio.Queue[tuple[float, str]] = asyncio.Queue()
         self._interp_pump_task: asyncio.Task | None = None
 
     # -- Twilio send ------------------------------------------------------
@@ -415,17 +417,29 @@ class CallSession:
 
         Only one pump runs per session, so two speak() loops can never
         interleave their μ-law chunks into the same Twilio stream (the
-        stutter seen in live calls). Between translations it waits out the
-        echo tail so the next segment's ASR isn't contaminated."""
+        stutter seen in live calls). Between translations it waits only
+        until the already-scheduled audio has played out (the chunk clock),
+        not a fixed echo tail — the ASR buffer is protected by
+        _outbound_until, not by dead air. Stale queue items (the caller
+        spoke on while the bot fell behind) are dropped so the bot
+        re-syncs instead of reading 30s-old text."""
         try:
             while not self._closed:
-                text = await self._interp_q.get()
+                queued_at, text = await self._interp_q.get()
                 if self._closed:
                     break
+                # Re-sync: drop translations overtaken by newer content.
+                if time.monotonic() - queued_at > config.TRANSLATE_STALE_SEC:
+                    logger.info("[%s] interp stale drop (%.1fs late): %r",
+                              self.stream_sid, time.monotonic() - queued_at,
+                              text[:60])
+                    continue
                 await self.speak(text)
-                # Let Twilio's buffer drain + echo tail pass before the next
-                # translation starts over the caller's continuing speech.
-                await asyncio.sleep(config.ECHO_TAIL_SEC)
+                # Wait only for the already-scheduled audio to play out
+                # (speak() set _outbound_until to last-chunk + tail).
+                wait = self._outbound_until - time.monotonic()
+                if wait > 0:
+                    await asyncio.sleep(wait)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -463,7 +477,7 @@ class CallSession:
                 if self._closed:
                     break
                 logger.info("[%s] <<< interp: %s", self.stream_sid, sent)
-                await self._interp_q.put(sent)
+                await self._interp_q.put((time.monotonic(), sent))
             if self._interp_pump_task is None or self._interp_pump_task.done():
                 self._interp_pump_task = asyncio.create_task(self._interp_pump())
                 self._turn_tasks.add(self._interp_pump_task)
