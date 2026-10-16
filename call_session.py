@@ -107,6 +107,12 @@ class CallSession:
         # bot re-syncs with the caller instead of speaking hours-old text.
         self._interp_q: asyncio.Queue[tuple[float, str]] = asyncio.Queue()
         self._interp_pump_task: asyncio.Task | None = None
+        # False once Twilio sent 'stop' (caller hung up): close() then flushes
+        # the queued translations instead of dropping them.
+        self._stream_active = True
+        # True while the pump sits on the empty-queue get(); close() uses it
+        # to decide whether cancelling the pump is safe.
+        self._interp_pump_parked = False
 
     # -- Twilio send ------------------------------------------------------
 
@@ -137,16 +143,57 @@ class CallSession:
         await self.speak(config.WELCOME_TEXT)
 
     async def close(self):
+        # Two flavours of end:
+        # - stream cleared mid-call (barge-in / mode switch / accidental
+        #   clear): drop everything immediately, the caller wants silence now.
+        # - caller hung up: flush the interpret backlog so the last
+        #   translations still play out through Twilio's playback buffer
+        #   (observed in live calls: queued translations were killed the
+        #   instant the caller stopped talking).
+        mid_call = self._stream_active
         self._closed = True
-        # Drain queued translations without speaking (call is ending).
-        while not self._interp_q.empty():
+        self._stream_active = False
+        if mid_call:
+            while not self._interp_q.empty():
+                try:
+                    self._interp_q.get_nowait()
+                    self._interp_q.task_done()
+                except asyncio.QueueEmpty:
+                    break
+        # Give in-flight turns a grace window to finish scheduling audio and
+        # speak the backlog; cancel anything still running afterwards.
+        grace = 0.0 if mid_call else 12.0
+        pending = [t for t in self._turn_tasks if not t.done()]
+        # Pump parked on an empty queue: close() would burn the whole grace
+        # window waiting for it to wake on a get() that never completes.
+        # Cancel it (drops its parked state) and flush the queue directly.
+        if (not mid_call
+                and self._interp_pump_task is not None
+                and not self._interp_pump_task.done()
+                and self._interp_pump_parked):
+            # Parked on an empty queue (no _closed guard there): cancel it
+            # and wait for the cancellation to land, otherwise close() would
+            # burn the whole grace window waiting on a task that never wakes.
+            # In every other state (speak/flush/echo-wait) the pump exits on
+            # its own — leave it alone so the flush runs.
+            self._interp_pump_task.cancel()
             try:
-                self._interp_q.get_nowait()
-                self._interp_q.task_done()
-            except asyncio.QueueEmpty:
-                break
-        for t in self._turn_tasks:
-            if not t.done():
+                await self._interp_pump_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not mid_call and not self._interp_q.empty():
+            flush_task = asyncio.create_task(
+                self._flush_final("".join(t for _, t in
+                                          list(self._interp_q._queue))))
+            flush_task.add_done_callback(self._turn_tasks.discard)
+            pending.append(flush_task)
+        if pending:
+            if not mid_call and (not self._interp_q.empty()
+                                  or self.state == STATE_SPEAKING):
+                logger.info("[%s] call ending: flushing %d queued translation(s)",
+                            self.stream_sid, self._interp_q.qsize())
+            done, still = await asyncio.wait(pending, timeout=grace)
+            for t in still:
                 t.cancel()
 
     # -- Inbound events ---------------------------------------------------------
@@ -334,8 +381,17 @@ class CallSession:
 
     async def on_user_turn(self, user_text: str):
         """User finished a sentence (triggered by endpointing)."""
-        if self._closed or not user_text.strip():
+        if not user_text.strip():
             logger.info("[%s] turn skipped (empty)", self.stream_sid)
+            return
+        # Track this turn so close() can wait for it to finish flushing its
+        # translations after hang-up. (handle_turn is the task entry; adding
+        # the current task here is a no-op set add.)
+        cur = asyncio.current_task()
+        if cur is not None:
+            self._turn_tasks.add(cur)
+        if self._closed:
+            logger.info("[%s] turn skipped (closed)", self.stream_sid)
             return
         # Interpret mode: the caller speaks continuously, so every segment is
         # real content — never drop it because the bot is mid-playback.
@@ -428,11 +484,20 @@ class CallSession:
         continuous stream. Dropping late translations was worse — the dead
         air it created meant the lost playback time was never recovered and
         the lag snowballed into more drops."""
+        # Queue.get is not cancellable while parked; yield first so a
+        # close()/cancel landing right here still reaches the pump.
+        await asyncio.sleep(0)
         try:
-            while not self._closed:
-                queued_at, text = await self._interp_q.get()
-                if self._closed:
+            while True:
+                self._interp_pump_parked = True
+                try:
+                    item = await self._interp_q.get()
+                finally:
+                    self._interp_pump_parked = False
+                if self._closed and self._stream_active:
+                    # Mid-call clear (barge-in / mode switch): drop immediately.
                     break
+                queued_at, text = item
                 # Merge everything already queued into one playback so the
                 # backlog drains at real-time speed with no gaps and no loss.
                 merged = [text]
@@ -447,6 +512,14 @@ class CallSession:
                     logger.info("[%s] interp merge x%d (%.1fs late): %r",
                                 self.stream_sid, len(merged), late,
                                 " / ".join(m[:40] for m in merged))
+                if self._closed and not self._stream_active:
+                    # Hung up: bypass speak()'s _closed guard and schedule the
+                    # remaining chunks straight into Twilio's playback buffer;
+                    # Twilio replays buffered media after 'stop' before
+                    # tearing the channel down, so the caller's last
+                    # translations still reach the phone.
+                    await self._flush_final("".join(merged))
+                    break
                 await self.speak("".join(merged))
                 # Wait only for the already-scheduled audio to play out
                 # (speak() set _outbound_until to last-chunk + tail).
@@ -457,6 +530,31 @@ class CallSession:
             raise
         except Exception:
             logger.exception("[%s] interp pump failed", self.stream_sid)
+
+    async def _flush_final(self, text: str):
+        """Last-ditch playback after hang-up: send chunks without the usual
+        guards so queued translations are not silently lost."""
+        while not self._interp_q.empty():
+            try:
+                self._interp_q.get_nowait()
+                self._interp_q.task_done()
+            except asyncio.QueueEmpty:
+                break
+        if not text.strip():
+            return
+        t0 = time.monotonic()
+        sent = 0
+        try:
+            async for chunk in synthesize_stream(text):
+                await self._send_media(chunk)
+                sent += 1
+                ahead = t0 + sent * config.SEND_TICK_SEC - time.monotonic()
+                if ahead > 0:
+                    await asyncio.sleep(ahead)
+        except Exception:
+            logger.exception("[%s] final flush failed", self.stream_sid)
+        logger.info("[%s] hang-up flush: %.1fs audio scheduled",
+                    self.stream_sid, sent * 0.02)
 
     async def _interpret_turn(self, user_text: str):
         """Translation mode: translate and enqueue; no chat history, no barge-in.
@@ -487,14 +585,16 @@ class CallSession:
                  {"role": "user", "content": user_text}],
                 temperature=0.3,
             ):
-                if self._closed:
+                # Mid-call clear drops the backlog; after hang-up keep
+                # enqueuing so the pump flushes it into Twilio's buffer.
+                if self._closed and self._stream_active:
                     break
                 logger.info("[%s] <<< interp: %s", self.stream_sid, sent)
                 await self._interp_q.put((time.monotonic(), sent))
-            if self._interp_pump_task is None or self._interp_pump_task.done():
-                self._interp_pump_task = asyncio.create_task(self._interp_pump())
-                self._turn_tasks.add(self._interp_pump_task)
-                self._interp_pump_task.add_done_callback(self._turn_tasks.discard)
+                if self._interp_pump_task is None or self._interp_pump_task.done():
+                    self._interp_pump_task = asyncio.create_task(self._interp_pump())
+                    self._turn_tasks.add(self._interp_pump_task)
+                    self._interp_pump_task.add_done_callback(self._turn_tasks.discard)
         except asyncio.CancelledError:
             raise
         except Exception:

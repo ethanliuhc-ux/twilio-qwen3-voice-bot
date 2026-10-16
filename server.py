@@ -227,6 +227,9 @@ async def media_stream(ws: WebSocket):
 
             elif event == "stop":
                 logger.info("stream stopped: %s", stream_sid)
+                # Caller hung up: close() flushes queued translations instead
+                # of dropping them.
+                session._stream_active = False
                 break
 
     except WebSocketDisconnect:
