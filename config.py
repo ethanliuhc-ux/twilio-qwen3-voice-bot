@@ -74,13 +74,11 @@ REF_TEXTS = {
 
 # ASR tuning: auto = language detection (ja/zh/en mixed OK); can pin ja/zh/en
 ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "auto")
-ASR_PROMPT = os.environ.get(
-    "ASR_PROMPT",
-    "多语言电话会话，可能使用日语、普通话或英语。"
-    "中国、中華人民共和国、中学生、学生、先生、日本語、英語、"
-    "オーストラリア、メルボルン、東京、水道局、蛇口、止水栓、漏水、修理、予約、"
-    "電話番号、飛行機、ホテル。Hello, thank you, appointment, reservation.",
-)
+# Empty by default: Qwen3-ASR transcribes a long instructional prompt back as
+# "speech" when the audio window is mostly silence/echo — live calls showed
+# this exact string echoed and every such segment dropped (content loss).
+# Set it via env only if you accept that trade-off.
+ASR_PROMPT = os.environ.get("ASR_PROMPT", "")
 
 # ---------------------------------------------------------------------------
 # Audio format constants
@@ -110,7 +108,9 @@ TURN_END_SILENCE_SEC = float(os.environ.get("TURN_END_SILENCE_SEC", "0.8"))
 # ---------------------------------------------------------------------------
 # In interpret mode a segment is finalized after this much continuous speech
 # (no trailing silence required) so translation runs while the caller talks.
-TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "1500"))
+# 4000ms: long enough for complete thoughts; 1500 chopped the speech into
+# fragments ("engage in the luxury") that translated into stuttering clips.
+TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "4000"))
 TRANSLATE_PROMPT = os.environ.get(
     "TRANSLATE_PROMPT",
     "你是同声传译。把用户接下来输入的话翻译成目标语言。"

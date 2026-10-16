@@ -101,6 +101,10 @@ class CallSession:
         # Target language the user asked to translate INTO ("zh"/"ja"/"en");
         # None = auto-pick from the transcript's language.
         self.interp_target: str | None = None
+        # Interpret mode serializes playback through one pump task so two
+        # speak() loops can never interleave chunks into the Twilio stream.
+        self._interp_q: asyncio.Queue[str] = asyncio.Queue()
+        self._interp_pump_task: asyncio.Task | None = None
 
     # -- Twilio send ------------------------------------------------------
 
@@ -132,6 +136,13 @@ class CallSession:
 
     async def close(self):
         self._closed = True
+        # Drain queued translations without speaking (call is ending).
+        while not self._interp_q.empty():
+            try:
+                self._interp_q.get_nowait()
+                self._interp_q.task_done()
+            except asyncio.QueueEmpty:
+                break
         for t in self._turn_tasks:
             if not t.done():
                 t.cancel()
@@ -324,12 +335,20 @@ class CallSession:
         if self._closed or not user_text.strip():
             logger.info("[%s] turn skipped (empty)", self.stream_sid)
             return
-        if self.state == STATE_SPEAKING:
+        # Interpret mode: the caller speaks continuously, so every segment is
+        # real content — never drop it because the bot is mid-playback.
+        if self.state == STATE_SPEAKING and self.mode != "interpret":
             logger.info("[%s] turn skipped (bot still speaking)", self.stream_sid)
             return
         # Mode switching (spoken): recognized in both modes; a classify
         # failure is treated as a normal turn so chat never breaks.
-        command, target = await self._detect_mode_command(user_text)
+        # Skipped while the bot is playing (interpret mode): the echo of the
+        # bot's own voice can contain the trigger word and flip modes by
+        # accident; the caller can just say it again after playback.
+        if self.state != STATE_SPEAKING:
+            command, target = await self._detect_mode_command(user_text)
+        else:
+            command, target = None, None
         if command == "enter":
             logger.info("[%s] >>> user: %s", self.stream_sid, user_text)
             self.mode = "interpret"
@@ -391,11 +410,33 @@ class CallSession:
             self.state = STATE_LISTENING
             self.vad.reset()
 
+    async def _interp_pump(self):
+        """Single serialization point for interpret-mode playback.
+
+        Only one pump runs per session, so two speak() loops can never
+        interleave their μ-law chunks into the same Twilio stream (the
+        stutter seen in live calls). Between translations it waits out the
+        echo tail so the next segment's ASR isn't contaminated."""
+        try:
+            while not self._closed:
+                text = await self._interp_q.get()
+                if self._closed:
+                    break
+                await self.speak(text)
+                # Let Twilio's buffer drain + echo tail pass before the next
+                # translation starts over the caller's continuing speech.
+                await asyncio.sleep(config.ECHO_TAIL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[%s] interp pump failed", self.stream_sid)
+
     async def _interpret_turn(self, user_text: str):
-        """Translation mode: translate and speak; no chat history, no barge-in.
+        """Translation mode: translate and enqueue; no chat history, no barge-in.
 
         The caller keeps talking while we speak — their speech accumulates in
-        the ASR buffer and the endpointing loop opens the next segment."""
+        the ASR buffer and the endpointing loop opens the next segment.
+        Playback goes through _interp_pump so translations never overlap."""
         # Prompt-leak guard (PROJECT_SUMMARY trap #2): the ASR prompt can be
         # transcribed as speech; in chat mode finalize() drops it, but
         # interpret turns bypass finalize's guard, so check here. Without this
@@ -422,7 +463,11 @@ class CallSession:
                 if self._closed:
                     break
                 logger.info("[%s] <<< interp: %s", self.stream_sid, sent)
-                await self.speak(sent)
+                await self._interp_q.put(sent)
+            if self._interp_pump_task is None or self._interp_pump_task.done():
+                self._interp_pump_task = asyncio.create_task(self._interp_pump())
+                self._turn_tasks.add(self._interp_pump_task)
+                self._interp_pump_task.add_done_callback(self._turn_tasks.discard)
         except asyncio.CancelledError:
             raise
         except Exception:

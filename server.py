@@ -96,6 +96,7 @@ async def _endpointing_loop(session: CallSession):
     finalize_task: asyncio.Task | None = None
     while not session._closed:
         await asyncio.sleep(0.1)
+        now = time.monotonic()
         state = session.state
         voice_ms = session.vad._voice_ms
         # Voice arrived since the last poll (works in every state, including
@@ -114,9 +115,16 @@ async def _endpointing_loop(session: CallSession):
             # Open a turn only when the voiced frame was outside the echo window
             # (or the bot already stopped playing): echo_prefix < voiced means a
             # clean speech frame arrived.
+            # Interpret mode: never open a segment while the bot is still
+            # playing (or inside its echo tail) — the bot's own playback echo
+            # would open ghost segments and dispatch a second concurrent
+            # turn. The caller's real speech keeps accumulating in the ASR
+            # buffer and the next segment picks it up after playback ends.
             if (state == STATE_LISTENING
                     and not turn_open
-                    and session.vad._echo_ms < session.vad._voice_ms):
+                    and session.vad._echo_ms < session.vad._voice_ms
+                    and not (session.mode == "interpret"
+                            and now < session._outbound_until)):
                 turn_open = True
                 if session.mode == "interpret":
                     seg_bytes = len(session.asr._pcm)
