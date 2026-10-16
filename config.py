@@ -49,7 +49,7 @@ REF_AUDIO_PATH = os.environ.get("REF_AUDIO_PATH", "")
 REF_TEXT = os.environ.get("REF_TEXT", "")
 
 # TTS speed multiplier (1.0 = normal, >1 faster)
-TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.15"))
+TTS_SPEED = float(os.environ.get("TTS_SPEED", "1.25"))
 
 # Per-language reference audio: synthesize in the language whose native ref is
 # configured, to avoid cross-language accent contamination.
