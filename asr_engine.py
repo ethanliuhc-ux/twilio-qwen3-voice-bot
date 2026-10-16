@@ -79,19 +79,40 @@ class ASRSession:
     def __init__(self, sid: str = "?"):
         self._pcm = bytearray()
         self._sid = sid
+        self._busy = False
 
     async def feed(self, pcm16k: bytes) -> None:
         """Feed 16kHz s16le PCM. Transcription is handled solely by finalize (endpoint); this only buffers."""
         self._pcm.extend(pcm16k)
 
-    async def finalize(self) -> str:
-        """Transcribe the whole segment; returns the full text and resets for the next turn."""
-        audio = _trim_silence(bytes(self._pcm))
-        self._pcm.clear()
+    async def finalize(self, end: int | None = None) -> str:
+        """Transcribe the buffered segment; returns the text.
+
+        end=None: transcribe everything and clear the buffer (chat mode).
+        end=N: transcribe only the first N bytes and delete just those,
+        keeping audio that arrived during transcription (continuous
+        segmentation in translation mode). Returns "" (buffer kept intact)
+        when the trimmed speech is too short."""
+        if self._busy:
+            logger.info("[%s] ASR finalize skipped (busy)", self._sid)
+            return ""
+        segment = bytes(self._pcm[:end]) if end is not None else bytes(self._pcm)
+        audio = _trim_silence(segment)
         dur_ms = len(audio) / 2 / config.ASR_SAMPLE_RATE * 1000
         if len(audio) < config.ASR_SAMPLE_RATE:  # less than 0.5s of speech after trimming
             logger.info("[%s] ASR skip: voiced %.0fms too short", self._sid, dur_ms)
             return ""
+        if end is not None:
+            del self._pcm[:end]
+        else:
+            self._pcm.clear()
+        self._busy = True
+        try:
+            return await self._transcribe_and_guard(audio, dur_ms)
+        finally:
+            self._busy = False
+
+    async def _transcribe_and_guard(self, audio: bytes, dur_ms: float) -> str:
         t0 = time.monotonic()
         try:
             text = await _transcribe(audio)

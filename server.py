@@ -60,15 +60,37 @@ async def twiml(request: Request):
     return Response(content=xml, media_type="application/xml")
 
 
+async def _finalize_and_dispatch(session: CallSession, end: int | None):
+    """Finalize ASR off the polling loop and dispatch the turn task.
+
+    Runs as its own task so the endpointing loop keeps polling (and keeps
+    tracking voice/echo) while transcription + playback proceed."""
+    final = await session.asr.finalize(end)
+    if final.strip():
+        session._interrupted = False
+        task = asyncio.create_task(session.handle_turn(final))
+        session._turn_tasks.add(task)
+        task.add_done_callback(session._turn_tasks.discard)
+    else:
+        logger.info("[%s] endpoint: ASR empty, no turn", session.stream_sid)
+
+
 async def _endpointing_loop(session: CallSession):
     """Poll for user turn end: in listening state, once VAD silence exceeds the
     threshold and speech was accumulated -> finalize ASR and start a new turn.
 
     Speech that began while the bot was still playing (pure echo) does not open
-    a turn; only speech that started after the echo window does."""
+    a turn; only speech that started after the echo window does.
+
+    In interpret mode segmentation is continuous: a segment also fires after
+    TRANSLATE_MIN_VOICED_MS of speech without waiting for silence, and
+    finalize consumes only that segment's bytes so speech arriving during
+    transcription opens the next segment."""
     last_voice_at = time.monotonic()
     prev_voice_ms = 0.0
     turn_open = False
+    seg_start_len = 0
+    finalize_task: asyncio.Task | None = None
     while not session._closed:
         await asyncio.sleep(0.1)
         state = session.state
@@ -84,8 +106,23 @@ async def _endpointing_loop(session: CallSession):
                     and not turn_open
                     and session.vad._echo_ms < session.vad._voice_ms):
                 turn_open = True
+                seg_start_len = len(session.asr._pcm) - int(voice_ms * 32)
         prev_voice_ms = voice_ms
         if state != STATE_LISTENING:
+            continue
+        if turn_open and session.mode == "interpret":
+            # Continuous segmentation: finalize after enough speech, no silence
+            # needed. finalize() is busy-guarded; the loop never blocks on it.
+            if finalize_task is None or finalize_task.done():
+                finalize_task = None
+                voiced_min = int(config.TRANSLATE_MIN_VOICED_MS * 32)
+                end = min(len(session.asr._pcm), seg_start_len + voiced_min)
+                if end - seg_start_len >= voiced_min:
+                    logger.info("[%s] interp segment: voiced=%.0fms, finalizing",
+                                session.stream_sid, voice_ms)
+                    turn_open = False
+                    prev_voice_ms = 0.0
+                    finalize_task = asyncio.create_task(_finalize_and_dispatch(session, end))
             continue
         if voice_ms > 0:
             continue
@@ -93,16 +130,8 @@ async def _endpointing_loop(session: CallSession):
         if turn_open and silence > config.TURN_END_SILENCE_SEC:
             logger.info("[%s] endpoint: silence=%.1fs, finalizing ASR",
                         session.stream_sid, silence)
-            final = await session.asr.finalize()
-            if final.strip():
-                session._interrupted = False
-                task = asyncio.create_task(session.handle_turn(final))
-                session._turn_tasks.add(task)
-                task.add_done_callback(session._turn_tasks.discard)
-                await asyncio.sleep(0)
-            else:
-                logger.info("[%s] endpoint: ASR empty, no turn", session.stream_sid)
             turn_open = False
+            finalize_task = asyncio.create_task(_finalize_and_dispatch(session, None))
             last_voice_at = time.monotonic()
 
 

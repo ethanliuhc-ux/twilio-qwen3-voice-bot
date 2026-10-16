@@ -106,6 +106,29 @@ ECHO_TAIL_SEC = float(os.environ.get("ECHO_TAIL_SEC", "0.6"))
 TURN_END_SILENCE_SEC = float(os.environ.get("TURN_END_SILENCE_SEC", "0.8"))
 
 # ---------------------------------------------------------------------------
+# Real-time translation (interpret) mode
+# ---------------------------------------------------------------------------
+# In interpret mode a segment is finalized after this much continuous speech
+# (no trailing silence required) so translation runs while the caller talks.
+TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "1500"))
+TRANSLATE_PROMPT = os.environ.get(
+    "TRANSLATE_PROMPT",
+    "你是同声传译。把用户接下来输入的话翻译成目标语言。"
+    "目标语言：如果输入是日语则翻译成简体中文，如果输入是中文则翻译成日语，"
+    "如果输入是英语则翻译成简体中文。"
+    "只输出译文本身，不要任何解释、引号、前缀或标注。",
+)
+TRANSLATE_ON_TEXT = os.environ.get(
+    "TRANSLATE_ON_TEXT",
+    "好的，已进入实时翻译模式。请连续讲话，我会逐句翻译，您不用停顿。"
+    "如需退出，请说退出翻译。",
+)
+TRANSLATE_OFF_TEXT = os.environ.get(
+    "TRANSLATE_OFF_TEXT",
+    "好的，已退出翻译模式，我们继续正常对话。",
+)
+
+# ---------------------------------------------------------------------------
 # Service
 # ---------------------------------------------------------------------------
 PORT = int(os.environ.get("PORT", "8765"))

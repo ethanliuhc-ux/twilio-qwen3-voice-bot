@@ -94,6 +94,9 @@ class CallSession:
         # Wall-clock deadline until which inbound audio is still the bot's own
         # echo (outbound playback + tail). Used to gate barge-in and endpointing.
         self._outbound_until = 0.0
+        # "chat" = normal assistant; "interpret" = real-time translation mode
+        # (continuous segmentation, no barge-in, translation-only replies).
+        self.mode = "chat"
 
     # -- Twilio send ------------------------------------------------------
 
@@ -148,7 +151,11 @@ class CallSession:
 
         # Barge-in: voiced past the threshold AND sustained beyond what the
         # bot's own echo could explain (echo prefix shorter than voiced time).
+        # Disabled in interpret mode: the caller speaks continuously there,
+        # so the bot finishes each translation like a real interpreter (their
+        # speech is still captured and translated after playback).
         if (self.state == STATE_SPEAKING
+                and self.mode == "chat"
                 and voiced_ms >= config.BARGE_IN_MS
                 and echo_ms < voiced_ms):
             await self._barge_in()
@@ -267,6 +274,38 @@ class CallSession:
         except Exception:
             logger.exception("[%s] turn failed", self.stream_sid)
 
+    async def _detect_mode_command(self, text: str) -> str | None:
+        """Keyword pre-filter + one small LLM call: 'enter' / 'exit' / None.
+
+        Cheap guard first so normal turns pay zero extra latency."""
+        low = text.lower()
+        triggers = ("翻译", "translation", "翻訳", "通訳", "同传", "同声传译")
+        exits = ("退出", "结束翻译", "exit", "stop translat", "no longer translat")
+        if not any(k in low for k in triggers + exits):
+            return None
+        try:
+            reply = ""
+            async for sent in stream_chat(
+                [
+                    {"role": "system", "content":
+                        "分类用户这句话的意图，只输出一个词：ENTER_TRANSLATE（用户想开启实时翻译/"
+                        "同声传译模式）、EXIT_TRANSLATE（用户想退出翻译模式）、"
+                        "CHAT（普通对话，包括提到'翻译'这个词但并非要求开启模式，例如'这个词用英语怎么说'）。"},
+                    {"role": "user", "content": text},
+                ],
+                temperature=0.0,
+                max_tokens=16,
+            ):
+                reply += sent
+            reply = reply.strip().upper()
+            if "ENTER_TRANSLATE" in reply:
+                return "enter"
+            if "EXIT_TRANSLATE" in reply:
+                return "exit"
+        except Exception:
+            logger.exception("[%s] mode classify failed", self.stream_sid)
+        return None
+
     async def on_user_turn(self, user_text: str):
         """User finished a sentence (triggered by endpointing)."""
         if self._closed or not user_text.strip():
@@ -274,6 +313,22 @@ class CallSession:
             return
         if self.state == STATE_SPEAKING:
             logger.info("[%s] turn skipped (bot still speaking)", self.stream_sid)
+            return
+        # Mode switching (spoken): recognized in both modes; a classify
+        # failure is treated as a normal turn so chat never breaks.
+        command = await self._detect_mode_command(user_text)
+        if command == "enter":
+            logger.info("[%s] >>> user: %s", self.stream_sid, user_text)
+            self.mode = "interpret"
+            await self.speak(config.TRANSLATE_ON_TEXT)
+            return
+        if command == "exit" and self.mode == "interpret":
+            logger.info("[%s] >>> user: %s", self.stream_sid, user_text)
+            self.mode = "chat"
+            await self.speak(config.TRANSLATE_OFF_TEXT)
+            return
+        if self.mode == "interpret":
+            await self._interpret_turn(user_text)
             return
         # Barge-in path: the user interrupted the previous reply; their speech
         # since then is real and must be processed — clear the stale flag.
@@ -321,3 +376,31 @@ class CallSession:
             await self.asr.reset()
             self.state = STATE_LISTENING
             self.vad.reset()
+
+    async def _interpret_turn(self, user_text: str):
+        """Translation mode: translate and speak; no chat history, no barge-in.
+
+        The caller keeps talking while we speak — their speech accumulates in
+        the ASR buffer and the endpointing loop opens the next segment."""
+        logger.info("[%s] >>> caller: %s", self.stream_sid, user_text)
+        try:
+            async for sent in stream_chat(
+                [{"role": "system", "content": config.TRANSLATE_PROMPT},
+                 {"role": "user", "content": user_text}],
+                temperature=0.3,
+            ):
+                if self._closed:
+                    break
+                logger.info("[%s] <<< interp: %s", self.stream_sid, sent)
+                await self.speak(sent)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[%s] translate failed", self.stream_sid)
+            return
+        finally:
+            # speak() flips state back to LISTENING when it finishes normally;
+            # make sure the caller's next segment can open a turn.
+            if not self._closed:
+                self.state = STATE_LISTENING
+                self.vad.reset()
