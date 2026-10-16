@@ -143,8 +143,16 @@ async def _endpointing_loop(session: CallSession):
                             session.stream_sid, seg_voiced_ms)
                 turn_open = False
                 prev_voice_ms = 0.0
+                # Advance the segment boundary NOW: if finalize later returns
+                # "" (too short), the loop must not re-fire on the same
+                # bytes every poll (seen in live calls as a 100ms skip spam).
+                # The caller's speech keeps accumulating past this point and
+                # opens the next segment.
+                fire_bytes = seg_bytes
+                seg_bytes = len(session.asr._pcm)
+                seg_voiced_ms = 0.0
                 finalize_task = asyncio.create_task(
-                    _finalize_and_dispatch(session, seg_bytes))
+                    _finalize_and_dispatch(session, fire_bytes))
             continue
         if voice_ms > 0:
             continue

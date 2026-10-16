@@ -111,11 +111,9 @@ TURN_END_SILENCE_SEC = float(os.environ.get("TURN_END_SILENCE_SEC", "0.8"))
 # 2500ms balances latency vs fragmentation: 4000 let segments grow to 25s+
 # (bot fell 20-30s behind the caller); 1500 chopped into fragments.
 TRANSLATE_MIN_VOICED_MS = int(os.environ.get("TRANSLATE_MIN_VOICED_MS", "2500"))
-# A queued translation older than this (from caller speech that has long been
-# overtaken) is dropped instead of spoken — an interpreter re-syncs rather
-# than reading 30s-old text. Bounds the backlog when output speech is longer
-# than the input speech it translates.
-TRANSLATE_STALE_SEC = float(os.environ.get("TRANSLATE_STALE_SEC", "8.0"))
+# (Removed: TRANSLATE_STALE_SEC — late translations are now merged into one
+# continuous playback by _interp_pump instead of dropped; dropping created
+# dead air that snowballed the lag.)
 TRANSLATE_PROMPT = os.environ.get(
     "TRANSLATE_PROMPT",
     "你是同声传译。把用户接下来输入的话翻译成目标语言。"

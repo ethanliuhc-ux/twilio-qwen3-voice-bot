@@ -420,21 +420,34 @@ class CallSession:
         stutter seen in live calls). Between translations it waits only
         until the already-scheduled audio has played out (the chunk clock),
         not a fixed echo tail — the ASR buffer is protected by
-        _outbound_until, not by dead air. Stale queue items (the caller
-        spoke on while the bot fell behind) are dropped so the bot
-        re-syncs instead of reading 30s-old text."""
+        _outbound_until, not by dead air.
+
+        Backlog is MERGED, never dropped: when the queue holds multiple
+        translations (the bot fell behind because the translation speaks
+        longer than the source), they are concatenated and spoken as one
+        continuous stream. Dropping late translations was worse — the dead
+        air it created meant the lost playback time was never recovered and
+        the lag snowballed into more drops."""
         try:
             while not self._closed:
                 queued_at, text = await self._interp_q.get()
                 if self._closed:
                     break
-                # Re-sync: drop translations overtaken by newer content.
-                if time.monotonic() - queued_at > config.TRANSLATE_STALE_SEC:
-                    logger.info("[%s] interp stale drop (%.1fs late): %r",
-                              self.stream_sid, time.monotonic() - queued_at,
-                              text[:60])
-                    continue
-                await self.speak(text)
+                # Merge everything already queued into one playback so the
+                # backlog drains at real-time speed with no gaps and no loss.
+                merged = [text]
+                late = time.monotonic() - queued_at
+                while True:
+                    try:
+                        _, nxt = self._interp_q.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    merged.append(nxt)
+                if len(merged) > 1:
+                    logger.info("[%s] interp merge x%d (%.1fs late): %r",
+                                self.stream_sid, len(merged), late,
+                                " / ".join(m[:40] for m in merged))
+                await self.speak("".join(merged))
                 # Wait only for the already-scheduled audio to play out
                 # (speak() set _outbound_until to last-chunk + tail).
                 wait = self._outbound_until - time.monotonic()
