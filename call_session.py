@@ -97,6 +97,9 @@ class CallSession:
         # "chat" = normal assistant; "interpret" = real-time translation mode
         # (continuous segmentation, no barge-in, translation-only replies).
         self.mode = "chat"
+        # Target language the user asked to translate INTO ("zh"/"ja"/"en");
+        # None = auto-pick from the transcript's language.
+        self.interp_target: str | None = None
 
     # -- Twilio send ------------------------------------------------------
 
@@ -274,23 +277,29 @@ class CallSession:
         except Exception:
             logger.exception("[%s] turn failed", self.stream_sid)
 
-    async def _detect_mode_command(self, text: str) -> str | None:
-        """Keyword pre-filter + one small LLM call: 'enter' / 'exit' / None.
+    async def _detect_mode_command(self, text: str) -> tuple[str | None, str | None]:
+        """Keyword pre-filter + one small LLM call: ('enter'|'exit'|None, target).
 
-        Cheap guard first so normal turns pay zero extra latency."""
+        Cheap guard first so normal turns pay zero extra latency. `target` is
+        the language the user asked to translate into ('zh'/'ja'/'en'), if
+        stated."""
         low = text.lower()
         triggers = ("翻译", "translation", "翻訳", "通訳", "同传", "同声传译")
         exits = ("退出", "结束翻译", "exit", "stop translat", "no longer translat")
         if not any(k in low for k in triggers + exits):
-            return None
+            return None, None
         try:
             reply = ""
             async for sent in stream_chat(
                 [
                     {"role": "system", "content":
-                        "分类用户这句话的意图，只输出一个词：ENTER_TRANSLATE（用户想开启实时翻译/"
-                        "同声传译模式）、EXIT_TRANSLATE（用户想退出翻译模式）、"
-                        "CHAT（普通对话，包括提到'翻译'这个词但并非要求开启模式，例如'这个词用英语怎么说'）。"},
+                        "分类用户这句话。只输出一行：意图|目标语言。"
+                        "意图：ENTER_TRANSLATE（用户想开启实时翻译/同声传译模式）、"
+                        "EXIT_TRANSLATE（用户想退出翻译模式）、"
+                        "CHAT（普通对话，包括提到'翻译'这个词但并非要求开启模式，例如'这个词用英语怎么说'）。"
+                        "目标语言：用户希望译文使用的语言：zh、ja、en 或 none"
+                        "（例如'翻译成汉语/中文'→zh，'译成日语'→ja，'translate into English'→en，"
+                        "未说明→none）。"},
                     {"role": "user", "content": text},
                 ],
                 temperature=0.0,
@@ -298,13 +307,16 @@ class CallSession:
             ):
                 reply += sent
             reply = reply.strip().upper()
-            if "ENTER_TRANSLATE" in reply:
-                return "enter"
-            if "EXIT_TRANSLATE" in reply:
-                return "exit"
+            intent = reply.split("|")[0].strip()
+            lang_part = reply.split("|")[1].strip().lower() if "|" in reply else "none"
+            target = {"ZH": "zh", "JA": "ja", "EN": "en"}.get(lang_part.upper())
+            if "ENTER_TRANSLATE" in intent:
+                return "enter", target
+            if "EXIT_TRANSLATE" in intent:
+                return "exit", None
         except Exception:
             logger.exception("[%s] mode classify failed", self.stream_sid)
-        return None
+        return None, None
 
     async def on_user_turn(self, user_text: str):
         """User finished a sentence (triggered by endpointing)."""
@@ -316,10 +328,11 @@ class CallSession:
             return
         # Mode switching (spoken): recognized in both modes; a classify
         # failure is treated as a normal turn so chat never breaks.
-        command = await self._detect_mode_command(user_text)
+        command, target = await self._detect_mode_command(user_text)
         if command == "enter":
             logger.info("[%s] >>> user: %s", self.stream_sid, user_text)
             self.mode = "interpret"
+            self.interp_target = target
             await self.speak(config.TRANSLATE_ON_TEXT)
             return
         if command == "exit" and self.mode == "interpret":
@@ -382,10 +395,25 @@ class CallSession:
 
         The caller keeps talking while we speak — their speech accumulates in
         the ASR buffer and the endpointing loop opens the next segment."""
+        # Prompt-leak guard (PROJECT_SUMMARY trap #2): the ASR prompt can be
+        # transcribed as speech; in chat mode finalize() drops it, but
+        # interpret turns bypass finalize's guard, so check here. Without this
+        # the bot speaks its own prompt, transcribes its own playback, and
+        # loops.
+        if any(p in user_text for p in ("多语言电话会话", "書き起こす", "口語会話", "音声通話")):
+            logger.warning("[%s] interp prompt-leak dropped: %r", self.stream_sid, user_text[:60])
+            return
         logger.info("[%s] >>> caller: %s", self.stream_sid, user_text)
+        if self.interp_target:
+            lang_name = {"zh": "简体中文", "ja": "日语", "en": "英语"}.get(
+                self.interp_target, "简体中文")
+            prompt = (f"你是同声传译。把用户接下来输入的每一句话翻译成{lang_name}。"
+                      f"只输出译文本身，不要任何解释、引号、前缀或标注。")
+        else:
+            prompt = config.TRANSLATE_PROMPT
         try:
             async for sent in stream_chat(
-                [{"role": "system", "content": config.TRANSLATE_PROMPT},
+                [{"role": "system", "content": prompt},
                  {"role": "user", "content": user_text}],
                 temperature=0.3,
             ):

@@ -64,7 +64,9 @@ async def _finalize_and_dispatch(session: CallSession, end: int | None):
     """Finalize ASR off the polling loop and dispatch the turn task.
 
     Runs as its own task so the endpointing loop keeps polling (and keeps
-    tracking voice/echo) while transcription + playback proceed."""
+    tracking voice/echo) while transcription + playback proceed. The
+    consumed/empty outcomes are normal in interpret mode (too-short
+    segments), so log them at debug level."""
     final = await session.asr.finalize(end)
     if final.strip():
         session._interrupted = False
@@ -72,7 +74,7 @@ async def _finalize_and_dispatch(session: CallSession, end: int | None):
         session._turn_tasks.add(task)
         task.add_done_callback(session._turn_tasks.discard)
     else:
-        logger.info("[%s] endpoint: ASR empty, no turn", session.stream_sid)
+        logger.debug("[%s] endpoint: ASR empty, no turn", session.stream_sid)
 
 
 async def _endpointing_loop(session: CallSession):
@@ -89,7 +91,8 @@ async def _endpointing_loop(session: CallSession):
     last_voice_at = time.monotonic()
     prev_voice_ms = 0.0
     turn_open = False
-    seg_start_len = 0
+    seg_bytes = 0          # bytes of the current segment in the ASR buffer
+    seg_voiced_ms = 0.0    # voiced time of the current segment
     finalize_task: asyncio.Task | None = None
     while not session._closed:
         await asyncio.sleep(0.1)
@@ -97,8 +100,17 @@ async def _endpointing_loop(session: CallSession):
         voice_ms = session.vad._voice_ms
         # Voice arrived since the last poll (works in every state, including
         # right after a barge-in flipped the state to LISTENING):
-        if voice_ms > prev_voice_ms:
+        new_voice = voice_ms > prev_voice_ms
+        if new_voice:
             last_voice_at = time.monotonic()
+            if session.mode == "interpret":
+                # Attribute the delta to the current segment; a VAD restart
+                # (silence >300ms reset) starts a fresh segment.
+                if voice_ms > prev_voice_ms + seg_voiced_ms + 1:
+                    seg_voiced_ms = voice_ms
+                    seg_bytes = len(session.asr._pcm)
+                else:
+                    seg_voiced_ms += voice_ms - prev_voice_ms
             # Open a turn only when the voiced frame was outside the echo window
             # (or the bot already stopped playing): echo_prefix < voiced means a
             # clean speech frame arrived.
@@ -106,23 +118,25 @@ async def _endpointing_loop(session: CallSession):
                     and not turn_open
                     and session.vad._echo_ms < session.vad._voice_ms):
                 turn_open = True
-                seg_start_len = len(session.asr._pcm) - int(voice_ms * 32)
+                if session.mode == "interpret":
+                    seg_bytes = len(session.asr._pcm)
+                    seg_voiced_ms = voice_ms
         prev_voice_ms = voice_ms
         if state != STATE_LISTENING:
             continue
-        if turn_open and session.mode == "interpret":
+        if session.mode == "interpret":
             # Continuous segmentation: finalize after enough speech, no silence
-            # needed. finalize() is busy-guarded; the loop never blocks on it.
-            if finalize_task is None or finalize_task.done():
-                finalize_task = None
-                voiced_min = int(config.TRANSLATE_MIN_VOICED_MS * 32)
-                end = min(len(session.asr._pcm), seg_start_len + voiced_min)
-                if end - seg_start_len >= voiced_min:
-                    logger.info("[%s] interp segment: voiced=%.0fms, finalizing",
-                                session.stream_sid, voice_ms)
-                    turn_open = False
-                    prev_voice_ms = 0.0
-                    finalize_task = asyncio.create_task(_finalize_and_dispatch(session, end))
+            # needed. The segment consumes its own bytes so the next segment
+            # starts clean; no re-fire spam on stale windows.
+            if finalize_task is not None and not finalize_task.done():
+                continue
+            if turn_open and seg_voiced_ms >= config.TRANSLATE_MIN_VOICED_MS:
+                logger.info("[%s] interp segment: voiced=%.0fms, finalizing",
+                            session.stream_sid, seg_voiced_ms)
+                turn_open = False
+                prev_voice_ms = 0.0
+                finalize_task = asyncio.create_task(
+                    _finalize_and_dispatch(session, seg_bytes))
             continue
         if voice_ms > 0:
             continue
