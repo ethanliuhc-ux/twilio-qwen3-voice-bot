@@ -23,7 +23,11 @@ logger = logging.getLogger(__name__)
 _TRIM = True
 
 # ASR prompt-leak signatures: instructional prompt transcribed as speech (substring match)
-_PROMPT_LEAKS = ("書き起こす", "口語会話", "音声通話")
+_PROMPT_LEAKS = ("書き起こす", "口語会話", "音声通話",
+                 # zh ASR prompt signatures (it leaked back as "speech" in live
+                 # calls; Japanese-only signatures missed it)
+                 "多语言电话会话", "蛇口", "止水栓", "漏水",
+                 "appointment, reservation")
 
 
 def _trim_silence(pcm16k: bytes) -> bytes:
@@ -91,8 +95,10 @@ class ASRSession:
         end=None: transcribe everything and clear the buffer (chat mode).
         end=N: transcribe only the first N bytes and delete just those,
         keeping audio that arrived during transcription (continuous
-        segmentation in translation mode). Returns "" (buffer kept intact)
-        when the trimmed speech is too short."""
+        segmentation in translation mode). Returns "" when the trimmed speech
+        is too short — the consumed bytes are still dropped (the caller
+        already re-opened the next segment at that boundary); audio that
+        arrived after `end` is never lost."""
         if self._busy:
             logger.info("[%s] ASR finalize skipped (busy)", self._sid)
             return ""
@@ -101,6 +107,8 @@ class ASRSession:
         dur_ms = len(audio) / 2 / config.ASR_SAMPLE_RATE * 1000
         if len(audio) < config.ASR_SAMPLE_RATE:  # less than 0.5s of speech after trimming
             logger.info("[%s] ASR skip: voiced %.0fms too short", self._sid, dur_ms)
+            if end is not None:
+                del self._pcm[:end]
             return ""
         if end is not None:
             del self._pcm[:end]

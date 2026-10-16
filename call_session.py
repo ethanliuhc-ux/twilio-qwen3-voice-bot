@@ -16,6 +16,7 @@ import time
 import numpy as np
 
 import config
+import asr_engine
 from asr_engine import ASRSession
 from audio_codec import ulaw8k_to_pcm16_16k, ulaw_to_pcm16
 from llm_client import stream_chat
@@ -400,7 +401,7 @@ class CallSession:
         # interpret turns bypass finalize's guard, so check here. Without this
         # the bot speaks its own prompt, transcribes its own playback, and
         # loops.
-        if any(p in user_text for p in ("多语言电话会话", "書き起こす", "口語会話", "音声通話")):
+        if any(p in user_text for p in asr_engine._PROMPT_LEAKS):
             logger.warning("[%s] interp prompt-leak dropped: %r", self.stream_sid, user_text[:60])
             return
         logger.info("[%s] >>> caller: %s", self.stream_sid, user_text)
@@ -408,6 +409,7 @@ class CallSession:
             lang_name = {"zh": "简体中文", "ja": "日语", "en": "英语"}.get(
                 self.interp_target, "简体中文")
             prompt = (f"你是同声传译。把用户接下来输入的每一句话翻译成{lang_name}。"
+                      f"无论输入是什么语言，输出永远只能是{lang_name}。"
                       f"只输出译文本身，不要任何解释、引号、前缀或标注。")
         else:
             prompt = config.TRANSLATE_PROMPT
@@ -425,10 +427,10 @@ class CallSession:
             raise
         except Exception:
             logger.exception("[%s] translate failed", self.stream_sid)
-            return
         finally:
-            # speak() flips state back to LISTENING when it finishes normally;
-            # make sure the caller's next segment can open a turn.
-            if not self._closed:
+            # Do NOT flip to LISTENING here: this translation's audio is still
+            # draining through Twilio's buffer and its echo would open ghost
+            # segments. speak() already set state=LISTENING after its last
+            # chunk; _outbound_until gates the echo tail.
+            if not self._closed and self.state == STATE_THINKING:
                 self.state = STATE_LISTENING
-                self.vad.reset()
